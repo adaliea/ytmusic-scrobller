@@ -1,0 +1,18 @@
+services:
+  scrobbler:
+    build: .
+    container_name: yt-music-scrobbler-dev
+    env_file: .env
+    environment:
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+      - ./scrobbler.py:/app/scrobbler.py:ro
+    develop:
+      watch:
+        - action: sync
+          path: ./scrobbler.py
+          target: /app/scrobbler.py
+        - action: rebuild
+          path: ./requirements.txt

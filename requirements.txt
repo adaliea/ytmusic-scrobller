@@ -1,0 +1,2 @@
+ytmusicapi>=1.9.0
+pylast>=5.3.0
