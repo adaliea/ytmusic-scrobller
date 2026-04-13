@@ -24,7 +24,7 @@ def setup_ytmusic():
     print("  https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html")
     print()
 
-    config_dir = os.path.join(os.path.dirname(__file__), "config")
+    config_dir = "/config" if os.path.isdir("/config") else os.path.join(os.path.dirname(__file__), "config")
     os.makedirs(config_dir, exist_ok=True)
     output_path = os.path.join(config_dir, "browser.json")
 
@@ -65,7 +65,8 @@ def setup_lastfm():
     poll_interval = input("Poll interval in seconds [300]: ").strip() or "300"
     history_limit = input("History items to fetch per poll [50]: ").strip() or "50"
 
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    config_dir = "/config" if os.path.isdir("/config") else os.path.dirname(__file__)
+    env_path = os.path.join(config_dir, ".env")
     with open(env_path, "w") as f:
         f.write(f"LASTFM_API_KEY={api_key}\n")
         f.write(f"LASTFM_API_SECRET={api_secret}\n")

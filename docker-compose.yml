@@ -3,7 +3,31 @@ services:
     build: .
     container_name: yt-music-scrobbler
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
+      - path: config/.env
+        required: false
     volumes:
       - ./config:/config:ro
       - ./data:/data
+
+  setup-ytmusic:
+    build: .
+    container_name: yt-music-setup-ytmusic
+    volumes:
+      - ./config:/config
+    entrypoint: ["python", "-u", "setup.py", "--ytmusic"]
+    stdin_open: true
+    tty: true
+    profiles: ["setup"]
+
+  setup-lastfm:
+    build: .
+    container_name: yt-music-setup-lastfm
+    volumes:
+      - ./config:/config
+    entrypoint: ["python", "-u", "setup.py", "--lastfm"]
+    stdin_open: true
+    tty: true
+    profiles: ["setup"]
