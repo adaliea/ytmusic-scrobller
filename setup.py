@@ -2,7 +2,6 @@
 
 import os
 import sys
-import webbrowser
 
 import pylast
 from ytmusicapi import setup as ytmusic_setup
@@ -48,11 +47,11 @@ def setup_lastfm():
     auth_url = skg.get_web_auth_url()
 
     print()
-    print("Authorizing with Last.fm via your browser...")
-    print(f"Opening: {auth_url}")
+    print("Open this URL in your browser and authorize the application:")
     print()
-    webbrowser.open(auth_url)
-    input("Press Enter after you've authorized the application in your browser...")
+    print(f"  {auth_url}")
+    print()
+    input("Press Enter after you've authorized the application...")
 
     session_key = skg.get_web_auth_session_key(auth_url)
 
