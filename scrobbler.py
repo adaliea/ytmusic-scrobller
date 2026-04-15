@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import time
 
@@ -90,6 +91,92 @@ def mark_scrobbled(db, fp, title, artist, ts):
     db.commit()
 
 
+def clean_title(title):
+    """Remove featured artist tags and other parenthetical noise from a title.
+
+    Used both for scrobbling (so Last.fm gets a clean title) and for dedup matching.
+    Examples:
+        "Hope (feat. Winona Oak)" -> "Hope"
+        "Don't Let Me Down (Illenium Remix) (feat. D..." -> "Don't Let Me Down (Illenium Remix)"
+        "BANG BANG" -> "BANG BANG"
+    """
+    # Remove (feat. ...), (ft. ...), (with ...) — case insensitive
+    title = re.sub(r"\s*\((?:feat|ft|with)\.?\s+[^)]*\)\.?", "", title, flags=re.IGNORECASE)
+    # Also handle [feat. ...] brackets
+    title = re.sub(r"\s*\[(?:feat|ft|with)\.?\s+[^]]*\]", "", title, flags=re.IGNORECASE)
+    return title.strip()
+
+
+def normalize_for_match(text):
+    """Normalize a string for fuzzy comparison.
+
+    Strips parenthetical suffixes, punctuation, and extra whitespace,
+    then lowercases. Used only for dedup matching, not for scrobbling.
+    """
+    # Remove all parenthetical/bracket content
+    text = re.sub(r"\s*[\(\[][^)\]]*[\)\]]", "", text)
+    # Remove punctuation
+    text = re.sub(r"[^\w\s]", "", text)
+    # Collapse whitespace and lowercase
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def split_artists(artist_string):
+    """Split a combined artist string into individual artists.
+
+    Handles: "A & B", "A, B, & C", "A feat. B", "A ft. B", "A x B"
+    Returns the list of individual artist names.
+    """
+    # First split on feat./ft./with (these are secondary artists)
+    primary = re.split(r"\s+(?:feat|ft|with)\.?\s+", artist_string, flags=re.IGNORECASE)[0]
+    # Then split the primary part on &, comma, or "x" (as separator)
+    artists = re.split(r"\s*(?:,\s*(?:&\s*)?|&\s*|\s+x\s+)", primary)
+    return [a.strip() for a in artists if a.strip()]
+
+
+def artists_match(yt_artist, lastfm_artist):
+    """Check if a YT Music artist matches a Last.fm artist, accounting for
+    multi-artist strings and normalization.
+
+    The browser extension typically scrobbles only the primary artist,
+    while YT Music may list "A & B" or "A, B, & C".
+    """
+    yt_norm = normalize_for_match(yt_artist)
+    lastfm_norm = normalize_for_match(lastfm_artist)
+
+    # Direct match
+    if yt_norm == lastfm_norm:
+        return True
+
+    # Check if the Last.fm artist matches any individual YT artist
+    yt_individuals = [normalize_for_match(a) for a in split_artists(yt_artist)]
+    if lastfm_norm in yt_individuals:
+        return True
+
+    # Check if the first YT artist matches
+    if yt_individuals and yt_individuals[0] == lastfm_norm:
+        return True
+
+    return False
+
+
+def titles_match(yt_title, lastfm_title):
+    """Fuzzy match titles, ignoring parenthetical differences like (feat. ...) or (Remix)."""
+    # Try exact match first
+    if yt_title.lower() == lastfm_title.lower():
+        return True
+
+    # Try with cleaned titles (feat. removed)
+    if clean_title(yt_title).lower() == clean_title(lastfm_title).lower():
+        return True
+
+    # Try fully normalized (all parens removed, no punctuation)
+    if normalize_for_match(yt_title) == normalize_for_match(lastfm_title):
+        return True
+
+    return False
+
+
 def fetch_recent_lastfm(api_key, username):
     """Fetch recent Last.fm scrobbles using the public GET API (no auth needed)."""
     try:
@@ -121,9 +208,9 @@ def fetch_recent_lastfm(api_key, username):
 def is_on_lastfm(recent_tracks, artist, title):
     """Check if this track was recently scrobbled on Last.fm (e.g. by browser extension)."""
     for track in recent_tracks:
-        track_artist = track.get("artist", {}).get("#text", "").lower()
-        track_title = track.get("name", "").lower()
-        if track_artist == artist.lower() and track_title == title.lower():
+        track_artist = track.get("artist", {}).get("#text", "")
+        track_title = track.get("name", "")
+        if artists_match(artist, track_artist) and titles_match(title, track_title):
             return True
     return False
 
@@ -141,13 +228,19 @@ def get_lastfm_network():
 
 
 def extract_track_info(item):
-    """Extract artist, title, album, and liked status from a YT Music history item."""
-    title = item.get("title", "")
+    """Extract artist, title, album, and liked status from a YT Music history item.
+
+    Returns the primary artist only (first listed), and cleans featured artist
+    tags from the title since Last.fm handles featured artists separately.
+    """
+    raw_title = item.get("title", "")
     artists = item.get("artists")
     if artists and len(artists) > 0:
+        # Use only the first artist from the YT Music artists list
         artist = artists[0].get("name", "Unknown Artist")
     else:
         artist = "Unknown Artist"
+    title = clean_title(raw_title)
     album_info = item.get("album")
     album = album_info.get("name", "") if album_info else ""
     liked = item.get("likeStatus") == "LIKE"
@@ -242,8 +335,16 @@ def poll_and_scrobble(ytmusic, network, username, api_key, db):
             log.debug("Skipping item with missing metadata: %s", video_id)
             continue
 
+        # For dedup, use the raw title and a combined artist string so fuzzy
+        # matching can compare against however the extension scrobbled it
+        raw_title = item.get("title", "")
+        all_artist_names = ", ".join(
+            a.get("name", "") for a in (item.get("artists") or [])
+        )
+        dedup_artist = all_artist_names or artist
+
         # Check if the browser extension already scrobbled this
-        if is_on_lastfm(recent_lastfm, artist, title):
+        if is_on_lastfm(recent_lastfm, dedup_artist, raw_title):
             log.info("Already on Last.fm (likely from extension): %s - %s", artist, title)
             continue
 
