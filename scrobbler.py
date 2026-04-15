@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import re
@@ -19,6 +20,9 @@ log = logging.getLogger("yt-scrobbler")
 DB_PATH = os.environ.get("DB_PATH", "/data/scrobbled.db")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 300))
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", 50))
+LASTFM_GRACE_PERIOD = int(os.environ.get("LASTFM_GRACE_PERIOD", 5))
+# Number of history items to store for sequence matching
+HISTORY_ANCHOR_SIZE = 10
 
 
 def init_db():
@@ -27,14 +31,6 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY,
             value TEXT
-        )"""
-    )
-    db.execute(
-        """CREATE TABLE IF NOT EXISTS scrobbled (
-            fingerprint TEXT PRIMARY KEY,
-            title TEXT,
-            artist TEXT,
-            scrobbled_at INTEGER
         )"""
     )
     db.commit()
@@ -49,44 +45,6 @@ def get_state(db, key):
 def set_state(db, key, value):
     db.execute(
         "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, value)
-    )
-    db.commit()
-
-
-def history_fingerprint(items):
-    """Create a fingerprint of the top of history to detect changes."""
-    parts = []
-    for item in items[:5]:
-        vid = item.get("videoId", "")
-        title = item.get("title", "")
-        parts.append(f"{vid}:{title}")
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-
-
-def item_fingerprint(item, position):
-    """Fingerprint a single history item including its position context.
-
-    We hash videoId + title + the videoIds of adjacent items to create a
-    play-session-unique identifier. This allows the same song to appear
-    multiple times in history (replays) while still deduplicating within
-    the same poll window.
-    """
-    vid = item.get("videoId", "")
-    title = item.get("title", "")
-    return hashlib.sha256(f"{vid}:{title}:{position}".encode()).hexdigest()[:20]
-
-
-def was_scrobbled(db, fp):
-    row = db.execute(
-        "SELECT 1 FROM scrobbled WHERE fingerprint = ?", (fp,)
-    ).fetchone()
-    return row is not None
-
-
-def mark_scrobbled(db, fp, title, artist, ts):
-    db.execute(
-        "INSERT OR IGNORE INTO scrobbled (fingerprint, title, artist, scrobbled_at) VALUES (?, ?, ?, ?)",
-        (fp, title, artist, ts),
     )
     db.commit()
 
@@ -177,18 +135,24 @@ def titles_match(yt_title, lastfm_title):
     return False
 
 
-def fetch_recent_lastfm(api_key, username):
-    """Fetch recent Last.fm scrobbles using the public GET API (no auth needed)."""
+def fetch_recent_lastfm(api_key, username, since_ts=None):
+    """Fetch recent Last.fm scrobbles using the public GET API (no auth needed).
+
+    If since_ts is provided, only returns scrobbles after that timestamp.
+    """
     try:
+        params = {
+            "method": "user.getRecentTracks",
+            "user": username,
+            "api_key": api_key,
+            "format": "json",
+            "limit": 50,
+        }
+        if since_ts:
+            params["from"] = since_ts
         resp = httpx.get(
             "https://ws.audioscrobbler.com/2.0/",
-            params={
-                "method": "user.getRecentTracks",
-                "user": username,
-                "api_key": api_key,
-                "format": "json",
-                "limit": 50,
-            },
+            params=params,
             timeout=10,
         )
         log.debug("Last.fm getRecentTracks status=%d", resp.status_code)
@@ -257,28 +221,75 @@ def fetch_history(ytmusic):
         return []
 
 
-def find_new_items(history, last_top_video_id):
+def history_to_sequence(items):
+    """Convert history items to a list of videoId strings for sequence matching."""
+    return [item.get("videoId", "") for item in items]
+
+
+def save_history_anchor(db, history):
+    """Save the top N items as a JSON list of videoIds for sequence matching."""
+    seq = history_to_sequence(history[:HISTORY_ANCHOR_SIZE])
+    set_state(db, "history_anchor", json.dumps(seq))
+
+
+def load_history_anchor(db):
+    """Load the stored anchor sequence."""
+    raw = get_state(db, "history_anchor")
+    if raw:
+        return json.loads(raw)
+    return None
+
+
+def find_new_items(history, anchor):
     """Find items in history that appeared since the last poll.
 
-    YT Music history is ordered most-recent-first. We find where the
-    previous top item now sits and return everything above it (the new plays).
-    If the previous top item is gone (scrolled out), we return nothing to
-    avoid mass-scrobbling old entries.
+    Uses sequence matching against the stored anchor (top N videoIds from
+    last poll). Finds where the anchor sequence starts in the current
+    history by looking for a run of 2+ consecutive matching videoIds.
+    This handles replays of the top song correctly — a single videoId
+    match could be a replay, but 2+ consecutive matches means we found
+    the real boundary.
     """
-    if last_top_video_id is None:
-        # First run — don't scrobble the entire history, just record the top
+    if anchor is None:
+        # First run — don't scrobble the entire history, just record state
         return []
 
-    for i, item in enumerate(history):
-        if item.get("videoId") == last_top_video_id:
-            return history[:i]  # everything newer than the last-seen top
+    current_ids = history_to_sequence(history)
 
-    # Previous top not found in current history window — too many new items
-    # or history shifted significantly. Be conservative: skip this cycle.
+    # Try to find where the anchor sequence appears in current history.
+    # Look for at least 2 consecutive matching IDs to avoid false matches
+    # from replayed songs.
+    min_match = min(2, len(anchor))
+
+    for i in range(len(current_ids)):
+        # Check if anchor starts at position i
+        match_count = 0
+        for j in range(min(len(anchor), len(current_ids) - i)):
+            if current_ids[i + j] == anchor[j]:
+                match_count += 1
+            else:
+                break
+
+        if match_count >= min_match:
+            log.debug(
+                "Anchor matched at position %d (%d consecutive IDs).", i, match_count
+            )
+            return history[:i]
+
+    # Try single-ID fallback: if the anchor's first ID appears and it's
+    # not at position 0, use it. This handles cases where only 1 anchor
+    # item remains in the history window.
+    for i in range(1, len(current_ids)):
+        if current_ids[i] == anchor[0]:
+            log.debug("Anchor single-ID fallback matched at position %d.", i)
+            return history[:i]
+
+    # Anchor not found at all — history shifted too much. Skip this cycle.
     log.warning(
-        "Previous top track (%s) not found in history. "
-        "Skipping this cycle to avoid duplicates.",
-        last_top_video_id,
+        "Anchor sequence not found in history. "
+        "Skipping this cycle to avoid duplicates. "
+        "Anchor: %s",
+        anchor[:3],
     )
     return []
 
@@ -305,12 +316,12 @@ def poll_and_scrobble(ytmusic, network, username, api_key, db):
             item.get("likeStatus"),
         )
 
-    last_top = get_state(db, "last_top_video_id")
-    new_items = find_new_items(history, last_top)
+    anchor = load_history_anchor(db)
+    new_items = find_new_items(history, anchor)
 
-    # Always update the top marker
+    # Always update the anchor
     if history:
-        set_state(db, "last_top_video_id", history[0].get("videoId", ""))
+        save_history_anchor(db, history)
 
     if not new_items:
         log.info("No new tracks since last poll.")
@@ -318,9 +329,31 @@ def poll_and_scrobble(ytmusic, network, username, api_key, db):
 
     log.info("Found %d new track(s) to process.", len(new_items))
 
-    # Fetch Last.fm recent tracks once per cycle (public GET, no auth issues)
-    recent_lastfm = fetch_recent_lastfm(api_key, username)
-    log.debug("Fetched %d recent Last.fm scrobbles for dedup.", len(recent_lastfm))
+    # Grace period: give the browser extension time to submit its scrobbles
+    # before we check Last.fm for duplicates
+    if LASTFM_GRACE_PERIOD > 0:
+        log.debug("Waiting %ds for browser extension to submit scrobbles...", LASTFM_GRACE_PERIOD)
+        time.sleep(LASTFM_GRACE_PERIOD)
+
+    # Fetch only new Last.fm scrobbles since our last check
+    lastfm_since = get_state(db, "lastfm_last_ts")
+    lastfm_since_ts = int(lastfm_since) if lastfm_since else None
+    recent_lastfm = fetch_recent_lastfm(api_key, username, since_ts=lastfm_since_ts)
+    log.debug(
+        "Fetched %d recent Last.fm scrobbles for dedup (since ts=%s).",
+        len(recent_lastfm),
+        lastfm_since_ts,
+    )
+
+    # Update the Last.fm timestamp watermark to the most recent scrobble
+    if recent_lastfm:
+        newest_ts = max(
+            int(t.get("date", {}).get("uts", 0))
+            for t in recent_lastfm
+            if not t.get("@attr", {}).get("nowplaying")
+        )
+        if newest_ts:
+            set_state(db, "lastfm_last_ts", str(newest_ts))
 
     scrobbled_count = 0
 
